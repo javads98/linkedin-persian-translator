@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "LinkedIn Persian Translator | مترجم فارسی لینکدین",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Translate LinkedIn pages to Persian (Farsi) - handles dynamic content and Shadow DOM | ترجمه صفحات لینکدین به فارسی",
   "permissions": [
     "activeTab",
-    "storage"
+    "storage",
+    "contextMenus"
   ],
   "host_permissions": [
     "https://www.linkedin.com/*",
@@ -19,7 +20,8 @@
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
-    }
+    },
+    "default_title": "مترجم فارسی لینکدین"
   },
   "content_scripts": [
     {
@@ -39,5 +41,8 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
+  },
+  "omnibox": {
+    "keyword": "fa"
   }
 }
