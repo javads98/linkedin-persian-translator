@@ -1,0 +1,66 @@
+/* LinkedIn Persian Translator - Content Styles */
+
+/* Floating translate button */
+#lt-floating-btn {
+  position: fixed;
+  bottom: 24px;
+  left: 24px;
+  z-index: 999999;
+  cursor: pointer;
+  user-select: none;
+  font-family: 'Vazirmatn', 'Tahoma', 'Arial', sans-serif;
+  transition: all 0.3s ease;
+}
+
+#lt-floating-btn .lt-btn-inner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: linear-gradient(135deg, #0a66c2, #004182);
+  color: white;
+  padding: 12px 20px;
+  border-radius: 50px;
+  box-shadow: 0 4px 16px rgba(10, 102, 194, 0.4);
+  font-size: 14px;
+  font-weight: 600;
+  transition: all 0.3s ease;
+}
+
+#lt-floating-btn:hover .lt-btn-inner {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 24px rgba(10, 102, 194, 0.5);
+}
+
+#lt-floating-btn.lt-active .lt-btn-inner {
+  background: linear-gradient(135deg, #057642, #03512d);
+  box-shadow: 0 4px 16px rgba(5, 118, 66, 0.4);
+}
+
+#lt-floating-btn.lt-active:hover .lt-btn-inner {
+  box-shadow: 0 6px 24px rgba(5, 118, 66, 0.5);
+}
+
+#lt-floating-btn.lt-loading .lt-btn-inner {
+  background: linear-gradient(135deg, #e68523, #b65a0c);
+  animation: lt-pulse 1.5s infinite;
+}
+
+@keyframes lt-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+.lt-btn-icon {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.lt-btn-text {
+  direction: rtl;
+}
+
+/* Translated text styling */
+[data-lt-translated] {
+  font-family: 'Vazirmatn', 'Tahoma', 'B Nazanin', 'Arial', sans-serif !important;
+  line-height: 1.8 !important;
+}
