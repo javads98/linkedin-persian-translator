@@ -1,4 +1,4 @@
-// Popup script for LinkedIn Persian Translator
+// Popup script for LinkedIn Persian Translator v2
 
 document.addEventListener('DOMContentLoaded', async () => {
   const translateBtn = document.getElementById('translate-btn');
@@ -11,9 +11,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   const notLinkedIn = document.getElementById('not-linkedin');
   const mainControls = document.getElementById('main-controls');
 
-  // Check if we're on LinkedIn
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  const isLinkedIn = tab && tab.url && (tab.url.includes('linkedin.com'));
+  // Check if on LinkedIn
+  let tab;
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    tab = tabs[0];
+  } catch (e) {
+    console.error('Tab query error:', e);
+  }
+
+  const isLinkedIn = tab && tab.url && tab.url.includes('linkedin.com');
 
   if (!isLinkedIn) {
     notLinkedIn.style.display = 'block';
@@ -21,58 +28,66 @@ document.addEventListener('DOMContentLoaded', async () => {
     return;
   }
 
-  // Load saved settings
-  chrome.storage.local.get(['translationEnabled', 'autoTranslate', 'translationEngine'], (data) => {
-    autoTranslateToggle.checked = data.autoTranslate || false;
-    translationEngine.value = data.translationEngine || 'google';
-    updateUI(data.translationEnabled || false);
-  });
+  // Load settings
+  chrome.storage.local.get(
+    ['translationEnabled', 'autoTranslate', 'translationEngine'],
+    (data) => {
+      autoTranslateToggle.checked = data.autoTranslate || false;
+      translationEngine.value = data.translationEngine || 'google';
+      updateUI(data.translationEnabled || false);
+    }
+  );
 
-  // Get current status from content script
-  try {
-    chrome.tabs.sendMessage(tab.id, { action: 'getStatus' }, (response) => {
-      if (chrome.runtime.lastError) {
-        // Content script might not be loaded yet
-        return;
-      }
-      if (response) {
-        updateUI(response.translationEnabled);
-        translatedCount.textContent = toPersianNumber(response.nodeCount || 0);
-      }
-    });
-  } catch (e) {
-    // ignore
+  // Get status from content script
+  function refreshStatus() {
+    try {
+      chrome.tabs.sendMessage(tab.id, { action: 'getStatus' }, (response) => {
+        if (chrome.runtime.lastError) return;
+        if (response) {
+          updateUI(response.translationEnabled);
+          translatedCount.textContent = toPersianNumber(response.nodeCount || 0);
+        }
+      });
+    } catch (e) {}
   }
+  refreshStatus();
 
-  // Translate button click
-  translateBtn.addEventListener('click', async () => {
+  // Translate button
+  translateBtn.addEventListener('click', () => {
     translateBtn.disabled = true;
-    translateBtn.textContent = '...⏳ در حال ترجمه';
+    translateBtn.textContent = '⏳ در حال ترجمه...';
 
-    chrome.tabs.sendMessage(tab.id, { action: 'toggleTranslation', enabled: true }, (response) => {
-      translateBtn.disabled = false;
-      if (response && response.success) {
-        updateUI(true);
+    chrome.tabs.sendMessage(
+      tab.id,
+      { action: 'toggleTranslation', enabled: true },
+      (response) => {
+        translateBtn.disabled = false;
+        translateBtn.textContent = '🇮🇷 ترجمه صفحه به فارسی';
+        if (response && response.success) {
+          updateUI(true);
+        }
       }
-      translateBtn.textContent = '🇮🇷 ترجمه صفحه به فارسی';
-    });
+    );
   });
 
-  // Revert button click
+  // Revert button
   revertBtn.addEventListener('click', () => {
-    chrome.tabs.sendMessage(tab.id, { action: 'revertTranslation' }, (response) => {
-      if (response && response.success) {
-        updateUI(false);
+    chrome.tabs.sendMessage(
+      tab.id,
+      { action: 'revertTranslation' },
+      (response) => {
+        if (response && response.success) {
+          updateUI(false);
+        }
       }
-    });
+    );
   });
 
-  // Auto translate toggle
+  // Settings
   autoTranslateToggle.addEventListener('change', () => {
     chrome.storage.local.set({ autoTranslate: autoTranslateToggle.checked });
   });
 
-  // Translation engine change
   translationEngine.addEventListener('change', () => {
     chrome.storage.local.set({ translationEngine: translationEngine.value });
   });
@@ -94,21 +109,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function toPersianNumber(num) {
     const persianDigits = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];
-    return String(num).replace(/\d/g, d => persianDigits[d]);
+    return String(num).replace(/\d/g, (d) => persianDigits[d]);
   }
 
-  // Auto-refresh stats
-  setInterval(() => {
-    if (!isLinkedIn) return;
-    try {
-      chrome.tabs.sendMessage(tab.id, { action: 'getStatus' }, (response) => {
-        if (chrome.runtime.lastError) return;
-        if (response) {
-          translatedCount.textContent = toPersianNumber(response.nodeCount || 0);
-        }
-      });
-    } catch (e) {
-      // ignore
-    }
-  }, 2000);
+  // Auto-refresh
+  setInterval(refreshStatus, 2000);
 });

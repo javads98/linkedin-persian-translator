@@ -1,5 +1,5 @@
-// Content script for LinkedIn Persian Translator
-// Handles LinkedIn's dynamic DOM, Shadow DOM, and React-rendered content
+// Content script for LinkedIn Persian Translator v2
+// Completely rewritten — works at the TEXT NODE level for maximum compatibility
 
 (function () {
   'use strict';
@@ -11,31 +11,47 @@
   let translationEnabled = false;
   let autoTranslate = false;
   let observer = null;
-  const translatedNodes = new WeakSet();
-  const originalTexts = new WeakMap();
-  const BATCH_INTERVAL = 300;
-  let pendingNodes = [];
+  const translatedTextNodes = new WeakSet();
+  const originalTextMap = new WeakMap(); // textNode -> original text
+  const BATCH_INTERVAL = 500;
+  let pendingRoots = [];
   let batchTimer = null;
 
-  // Persian detection regex
-  const PERSIAN_REGEX = /[\u0600-\u06FF\uFB50-\uFDFF\uFE70-\uFEFF]/;
+  const SKIP_TAGS = new Set([
+    'SCRIPT', 'STYLE', 'SVG', 'PATH', 'CIRCLE', 'RECT', 'LINE', 'POLYGON',
+    'IMG', 'VIDEO', 'AUDIO', 'CANVAS', 'CODE', 'PRE', 'INPUT', 'TEXTAREA',
+    'SELECT', 'IFRAME', 'NOSCRIPT', 'TEMPLATE', 'MATH', 'HEAD', 'META',
+    'LINK', 'BR', 'HR', 'WBR'
+  ]);
 
   // ============================================================
-  // Initialization
+  // Logging
+  // ============================================================
+  function log(...args) {
+    console.log('[LinkedIn-FA]', ...args);
+  }
+
+  // ============================================================
+  // Init
   // ============================================================
   function init() {
-    // Load settings
+    log('Extension loaded on', location.href);
+
     chrome.runtime.sendMessage({ action: 'getSettings' }, (response) => {
+      if (chrome.runtime.lastError) {
+        log('Settings error:', chrome.runtime.lastError.message);
+        return;
+      }
       if (response) {
         translationEnabled = response.translationEnabled;
         autoTranslate = response.autoTranslate;
+        log('Settings:', { translationEnabled, autoTranslate });
         if (autoTranslate && translationEnabled) {
           startTranslation();
         }
       }
     });
 
-    // Listen for messages from popup
     chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       if (request.action === 'toggleTranslation') {
         if (request.enabled) {
@@ -53,20 +69,24 @@
         sendResponse({
           isTranslating,
           translationEnabled,
-          nodeCount: document.querySelectorAll('[data-lt-translated]').length
+          nodeCount: countTranslated()
         });
       }
       return true;
     });
 
-    // Create floating translate button
     createFloatingButton();
+  }
+
+  function countTranslated() {
+    return document.querySelectorAll('[data-lt-done]').length;
   }
 
   // ============================================================
   // Floating Button
   // ============================================================
   function createFloatingButton() {
+    if (document.getElementById('lt-floating-btn')) return;
     const btn = document.createElement('div');
     btn.id = 'lt-floating-btn';
     btn.innerHTML = `
@@ -89,316 +109,276 @@
   function updateFloatingButton() {
     const btn = document.getElementById('lt-floating-btn');
     if (!btn) return;
+    const textEl = btn.querySelector('.lt-btn-text');
     if (translationEnabled) {
       btn.classList.add('lt-active');
-      btn.querySelector('.lt-btn-text').textContent = 'بازگشت';
+      textEl.textContent = 'بازگشت';
     } else {
       btn.classList.remove('lt-active');
-      btn.querySelector('.lt-btn-text').textContent = 'ترجمه';
+      textEl.textContent = 'ترجمه';
     }
     if (isTranslating) {
       btn.classList.add('lt-loading');
-      btn.querySelector('.lt-btn-text').textContent = '...در حال ترجمه';
+      textEl.textContent = '...در حال ترجمه';
     } else {
       btn.classList.remove('lt-loading');
     }
   }
 
   // ============================================================
-  // Translation Logic
+  // Core: Collect ALL translatable text nodes from the DOM
+  // ============================================================
+  function collectTextNodes(root) {
+    const textNodes = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        // Skip if already translated
+        if (translatedTextNodes.has(node)) return NodeFilter.FILTER_REJECT;
+
+        // Skip empty / whitespace-only
+        const text = node.textContent.trim();
+        if (text.length < 2) return NodeFilter.FILTER_REJECT;
+
+        // Skip nodes inside our own UI
+        if (node.parentElement && node.parentElement.closest('#lt-floating-btn'))
+          return NodeFilter.FILTER_REJECT;
+
+        // Skip nodes inside skip tags
+        let parent = node.parentElement;
+        while (parent && parent !== root) {
+          if (SKIP_TAGS.has(parent.tagName)) return NodeFilter.FILTER_REJECT;
+          // Skip contenteditable (input fields)
+          if (parent.isContentEditable) return NodeFilter.FILTER_REJECT;
+          parent = parent.parentElement;
+        }
+
+        // Skip if already mostly Persian/Arabic
+        if (isPersian(text)) return NodeFilter.FILTER_REJECT;
+
+        // Skip if it's just a number, URL, email or emoji-only
+        if (/^[\d\s.,;:!?@#$%^&*()\-+=\[\]{}|\\/<>~`'"]+$/.test(text))
+          return NodeFilter.FILTER_REJECT;
+        if (/^https?:\/\//.test(text)) return NodeFilter.FILTER_REJECT;
+        if (/^[\w.-]+@[\w.-]+$/.test(text)) return NodeFilter.FILTER_REJECT;
+
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    let node;
+    while ((node = walker.nextNode())) {
+      textNodes.push(node);
+    }
+    return textNodes;
+  }
+
+  function isPersian(text) {
+    const persianChars = (text.match(/[\u0600-\u06FF\uFB50-\uFDFF\uFE70-\uFEFF]/g) || []).length;
+    const letters = text.replace(/[\s\d\W]/g, '').length;
+    return letters > 0 && persianChars / letters > 0.4;
+  }
+
+  // ============================================================
+  // Translation logic
   // ============================================================
   async function startTranslation() {
     if (isTranslating) return;
     isTranslating = true;
     translationEnabled = true;
-    updateFloatingButton();
-
-    // Save state
     chrome.storage.local.set({ translationEnabled: true });
+    updateFloatingButton();
+    log('Starting translation...');
 
     try {
-      // Translate existing content
-      await translatePage();
-
-      // Start observing for new content
+      await translateRoot(document.body);
       startObserver();
+      log('Translation complete. Translated elements:', countTranslated());
     } catch (err) {
-      console.error('[LinkedIn Translator] Error:', err);
+      log('Translation error:', err);
     } finally {
       isTranslating = false;
       updateFloatingButton();
     }
   }
 
+  async function translateRoot(root) {
+    const textNodes = collectTextNodes(root);
+    log(`Found ${textNodes.length} text nodes to translate`);
+
+    if (textNodes.length === 0) return;
+
+    // Group text nodes into batches for the API
+    const BATCH_SIZE = 20;
+    for (let i = 0; i < textNodes.length; i += BATCH_SIZE) {
+      if (!translationEnabled) break;
+
+      const batch = textNodes.slice(i, i + BATCH_SIZE);
+      const texts = batch.map(n => n.textContent.trim());
+
+      try {
+        const response = await new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage(
+            { action: 'translateBatch', texts, sourceLang: 'auto' },
+            (resp) => {
+              if (chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+              } else {
+                resolve(resp);
+              }
+            }
+          );
+        });
+
+        if (response && response.success && response.translations) {
+          for (let j = 0; j < batch.length; j++) {
+            const node = batch[j];
+            const translated = response.translations[j];
+            if (translated && translated !== texts[j]) {
+              // Save original
+              originalTextMap.set(node, node.textContent);
+              translatedTextNodes.add(node);
+
+              // Replace text content
+              // Preserve leading/trailing whitespace from original
+              const leading = node.textContent.match(/^\s*/)[0];
+              const trailing = node.textContent.match(/\s*$/)[0];
+              node.textContent = leading + translated + trailing;
+
+              // Mark the closest block-level parent for RTL
+              const blockParent = getBlockParent(node);
+              if (blockParent && !blockParent.hasAttribute('data-lt-done')) {
+                blockParent.setAttribute('data-lt-done', '1');
+                // Save original direction
+                if (!blockParent.hasAttribute('data-lt-orig-dir')) {
+                  blockParent.setAttribute('data-lt-orig-dir', blockParent.style.direction || '');
+                  blockParent.setAttribute('data-lt-orig-align', blockParent.style.textAlign || '');
+                }
+                blockParent.style.direction = 'rtl';
+                blockParent.style.textAlign = 'right';
+              }
+            }
+          }
+          log(`Batch ${Math.floor(i / BATCH_SIZE) + 1}: translated ${batch.length} nodes`);
+        } else {
+          log('Batch failed:', response);
+        }
+      } catch (err) {
+        log('Batch error:', err.message);
+      }
+
+      // Delay between batches to avoid rate-limiting
+      if (i + BATCH_SIZE < textNodes.length) {
+        await sleep(150);
+      }
+    }
+  }
+
+  function getBlockParent(textNode) {
+    let el = textNode.parentElement;
+    if (!el) return null;
+    // Walk up to find a reasonable container (not a tiny inline span)
+    const inlineTags = new Set(['SPAN', 'A', 'STRONG', 'B', 'EM', 'I', 'U', 'SMALL', 'SUB', 'SUP', 'ABBR', 'MARK']);
+    let attempts = 0;
+    while (el && inlineTags.has(el.tagName) && attempts < 5) {
+      el = el.parentElement;
+      attempts++;
+    }
+    return el;
+  }
+
+  // ============================================================
+  // Revert
+  // ============================================================
   function revertTranslation() {
+    log('Reverting translation...');
     translationEnabled = false;
     isTranslating = false;
     stopObserver();
 
-    // Revert all translated nodes
-    const translatedElements = document.querySelectorAll('[data-lt-translated]');
-    translatedElements.forEach(el => {
-      if (originalTexts.has(el)) {
-        // Restore original text nodes
-        const originals = originalTexts.get(el);
-        const textNodes = getTextNodes(el);
-        textNodes.forEach((node, i) => {
-          if (originals[i] !== undefined) {
-            node.textContent = originals[i];
-          }
-        });
-        el.removeAttribute('data-lt-translated');
-        el.style.direction = '';
-        el.style.textAlign = '';
-        translatedNodes.delete(el);
+    // Restore all text nodes
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (originalTextMap.has(node)) {
+        node.textContent = originalTextMap.get(node);
+        originalTextMap.delete(node);
+        translatedTextNodes.delete(node);
       }
+    }
+
+    // Restore direction on block parents
+    document.querySelectorAll('[data-lt-done]').forEach(el => {
+      el.style.direction = el.getAttribute('data-lt-orig-dir') || '';
+      el.style.textAlign = el.getAttribute('data-lt-orig-align') || '';
+      el.removeAttribute('data-lt-done');
+      el.removeAttribute('data-lt-orig-dir');
+      el.removeAttribute('data-lt-orig-align');
     });
 
     chrome.storage.local.set({ translationEnabled: false });
     updateFloatingButton();
-  }
-
-  async function translatePage() {
-    const elements = getTranslatableElements(document.body);
-    await translateElements(elements);
-  }
-
-  function getTranslatableElements(root) {
-    const elements = [];
-
-    // LinkedIn-specific selectors for content areas
-    const selectors = [
-      // Feed posts
-      '.feed-shared-update-v2__description',
-      '.feed-shared-text',
-      '.feed-shared-text__text-view',
-      '.feed-shared-inline-show-more-text',
-      // Comments
-      '.comments-comment-item__main-content',
-      '.comments-comment-texteditor',
-      // Profile
-      '.pv-about__summary-text',
-      '.pv-profile-section__card-item-v2',
-      '.text-body-medium',
-      '.text-body-small',
-      // Job descriptions
-      '.jobs-description__content',
-      '.jobs-unified-top-card__job-title',
-      // Messages
-      '.msg-s-event-listitem__body',
-      '.msg-s-message-group__meta',
-      // Navigation & UI
-      '.artdeco-button__text',
-      '.t-14', '.t-16', '.t-18', '.t-20', '.t-24',
-      '.t-bold',
-      // Generic text containers
-      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-      'p', 'span', 'a', 'li', 'td', 'th',
-      'label', 'button',
-      // Article content
-      '.reader-content',
-      '.article-content',
-      // Notifications
-      '.nt-card__text',
-      // Generic LinkedIn classes
-      '.ember-view',
-    ];
-
-    // Try specific selectors first
-    const specificElements = new Set();
-    selectors.forEach(selector => {
-      try {
-        root.querySelectorAll(selector).forEach(el => specificElements.add(el));
-      } catch (e) { /* skip invalid selectors */ }
-    });
-
-    // Filter and collect translatable elements
-    specificElements.forEach(el => {
-      if (shouldTranslateElement(el)) {
-        elements.push(el);
-      }
-    });
-
-    // Also walk the DOM for any text-containing elements we might have missed
-    const walker = document.createTreeWalker(
-      root,
-      NodeFilter.SHOW_ELEMENT,
-      {
-        acceptNode: (node) => {
-          if (specificElements.has(node)) return NodeFilter.FILTER_SKIP;
-          if (shouldTranslateElement(node) && hasDirectText(node)) {
-            return NodeFilter.FILTER_ACCEPT;
-          }
-          return NodeFilter.FILTER_SKIP;
-        }
-      }
-    );
-
-    let node;
-    while (node = walker.nextNode()) {
-      elements.push(node);
-    }
-
-    return elements;
-  }
-
-  function shouldTranslateElement(el) {
-    // Skip if already translated
-    if (translatedNodes.has(el) || el.hasAttribute('data-lt-translated')) return false;
-
-    // Skip hidden elements
-    if (el.offsetParent === null && el.tagName !== 'BODY') return false;
-
-    // Skip certain elements
-    const skipTags = ['SCRIPT', 'STYLE', 'SVG', 'PATH', 'IMG', 'VIDEO', 'AUDIO', 'CANVAS', 'CODE', 'PRE', 'INPUT', 'TEXTAREA', 'SELECT', 'IFRAME', 'NOSCRIPT'];
-    if (skipTags.includes(el.tagName)) return false;
-
-    // Skip our own elements
-    if (el.id === 'lt-floating-btn' || el.closest('#lt-floating-btn')) return false;
-
-    // Skip elements with no meaningful text
-    const text = getDirectText(el);
-    if (!text || text.trim().length < 2) return false;
-
-    // Skip if already Persian
-    if (isPersian(text)) return false;
-
-    return true;
-  }
-
-  function hasDirectText(el) {
-    return getDirectText(el).trim().length > 1;
-  }
-
-  function getDirectText(el) {
-    let text = '';
-    for (const child of el.childNodes) {
-      if (child.nodeType === Node.TEXT_NODE) {
-        text += child.textContent;
-      }
-    }
-    return text;
-  }
-
-  function getTextNodes(el) {
-    const nodes = [];
-    for (const child of el.childNodes) {
-      if (child.nodeType === Node.TEXT_NODE && child.textContent.trim().length > 0) {
-        nodes.push(child);
-      }
-    }
-    return nodes;
-  }
-
-  function isPersian(text) {
-    const persianChars = (text.match(/[\u0600-\u06FF\uFB50-\uFDFF\uFE70-\uFEFF]/g) || []).length;
-    const totalChars = text.replace(/[\s\d\W]/g, '').length;
-    return totalChars > 0 && (persianChars / totalChars) > 0.5;
-  }
-
-  async function translateElements(elements) {
-    if (elements.length === 0) return;
-
-    // Collect all text nodes and their content
-    const translateJobs = [];
-
-    for (const el of elements) {
-      const textNodes = getTextNodes(el);
-      if (textNodes.length === 0) continue;
-
-      const texts = textNodes.map(n => n.textContent.trim()).filter(t => t.length > 1 && !isPersian(t));
-      if (texts.length === 0) continue;
-
-      translateJobs.push({ element: el, textNodes, texts });
-    }
-
-    // Process in batches
-    const BATCH_SIZE = 15;
-    for (let i = 0; i < translateJobs.length; i += BATCH_SIZE) {
-      if (!translationEnabled) break;
-
-      const batch = translateJobs.slice(i, i + BATCH_SIZE);
-      const allTexts = batch.flatMap(job => job.texts);
-
-      try {
-        const response = await chrome.runtime.sendMessage({
-          action: 'translateBatch',
-          texts: allTexts,
-          sourceLang: 'auto'
-        });
-
-        if (response && response.success) {
-          let translationIndex = 0;
-          for (const job of batch) {
-            // Store original texts
-            const originals = job.textNodes.map(n => n.textContent);
-            originalTexts.set(job.element, originals);
-
-            // Apply translations
-            for (const textNode of job.textNodes) {
-              const originalText = textNode.textContent.trim();
-              if (originalText.length > 1 && !isPersian(originalText)) {
-                const translated = response.translations[translationIndex];
-                if (translated && translated !== originalText) {
-                  textNode.textContent = translated;
-                }
-                translationIndex++;
-              }
-            }
-
-            // Mark as translated and set RTL direction
-            job.element.setAttribute('data-lt-translated', 'true');
-            job.element.style.direction = 'rtl';
-            job.element.style.textAlign = 'right';
-            translatedNodes.add(job.element);
-          }
-        }
-      } catch (err) {
-        console.error('[LinkedIn Translator] Batch translation error:', err);
-      }
-
-      // Rate limiting delay between batches
-      if (i + BATCH_SIZE < translateJobs.length) {
-        await sleep(200);
-      }
-    }
+    log('Reverted.');
   }
 
   // ============================================================
-  // DOM Observer (for dynamic content)
+  // Observer for dynamic content
   // ============================================================
   function startObserver() {
     if (observer) return;
 
     observer = new MutationObserver((mutations) => {
-      if (!translationEnabled) return;
+      if (!translationEnabled || isTranslating) return;
 
+      let hasNew = false;
       for (const mutation of mutations) {
-        if (mutation.type === 'childList') {
-          for (const node of mutation.addedNodes) {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              queueNodeForTranslation(node);
+        if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+          for (const added of mutation.addedNodes) {
+            if (added.nodeType === Node.ELEMENT_NODE && !added.closest('#lt-floating-btn')) {
+              pendingRoots.push(added);
+              hasNew = true;
             }
           }
         }
-        // Handle text changes (LinkedIn often updates text content dynamically)
-        if (mutation.type === 'characterData') {
-          const parentEl = mutation.target.parentElement;
-          if (parentEl && !translatedNodes.has(parentEl)) {
-            queueNodeForTranslation(parentEl);
-          }
-        }
+      }
+
+      if (hasNew) {
+        if (batchTimer) clearTimeout(batchTimer);
+        batchTimer = setTimeout(processPendingRoots, BATCH_INTERVAL);
       }
     });
 
     observer.observe(document.body, {
       childList: true,
-      subtree: true,
-      characterData: true
+      subtree: true
     });
 
-    // Also watch for LinkedIn's infinite scroll and navigation
-    watchLinkedInNavigation();
+    // Watch for scroll-triggered lazy loading
+    let scrollTimer = null;
+    window.addEventListener('scroll', () => {
+      if (!translationEnabled || isTranslating) return;
+      if (scrollTimer) clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => {
+        pendingRoots.push(document.body);
+        processPendingRoots();
+      }, 1000);
+    }, { passive: true });
+
+    // Watch for LinkedIn SPA navigation
+    let lastUrl = location.href;
+    setInterval(() => {
+      if (location.href !== lastUrl) {
+        lastUrl = location.href;
+        log('URL changed to', lastUrl);
+        if (translationEnabled) {
+          setTimeout(() => {
+            pendingRoots.push(document.body);
+            processPendingRoots();
+          }, 2000);
+        }
+      }
+    }, 1000);
+
+    log('Observer started');
   }
 
   function stopObserver() {
@@ -406,63 +386,33 @@
       observer.disconnect();
       observer = null;
     }
-  }
-
-  function queueNodeForTranslation(node) {
-    pendingNodes.push(node);
-    if (batchTimer) clearTimeout(batchTimer);
-    batchTimer = setTimeout(processPendingNodes, BATCH_INTERVAL);
-  }
-
-  async function processPendingNodes() {
-    if (!translationEnabled || pendingNodes.length === 0) return;
-
-    const nodes = [...pendingNodes];
-    pendingNodes = [];
-
-    const elements = [];
-    for (const node of nodes) {
-      const els = getTranslatableElements(node);
-      elements.push(...els);
+    if (batchTimer) {
+      clearTimeout(batchTimer);
+      batchTimer = null;
     }
-
-    // Deduplicate
-    const uniqueElements = [...new Set(elements)];
-    if (uniqueElements.length > 0) {
-      await translateElements(uniqueElements);
-    }
+    pendingRoots = [];
   }
 
-  // ============================================================
-  // LinkedIn Navigation Watcher
-  // ============================================================
-  function watchLinkedInNavigation() {
-    // LinkedIn uses client-side routing; watch URL changes
-    let lastUrl = location.href;
+  async function processPendingRoots() {
+    if (!translationEnabled || isTranslating || pendingRoots.length === 0) return;
+    isTranslating = true;
+    updateFloatingButton();
 
-    const urlObserver = new MutationObserver(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
-        // Wait for new content to load, then translate
-        setTimeout(() => {
-          if (translationEnabled) {
-            translatePage();
-          }
-        }, 1500);
+    const roots = [...pendingRoots];
+    pendingRoots = [];
+
+    try {
+      for (const root of roots) {
+        if (root.isConnected) {
+          await translateRoot(root);
+        }
       }
-    });
-
-    urlObserver.observe(document.body, { childList: true, subtree: true });
-
-    // Also handle scroll events for lazy-loaded content
-    let scrollTimer = null;
-    window.addEventListener('scroll', () => {
-      if (!translationEnabled) return;
-      if (scrollTimer) clearTimeout(scrollTimer);
-      scrollTimer = setTimeout(() => {
-        translatePage();
-      }, 800);
-    }, { passive: true });
+    } catch (err) {
+      log('Process pending error:', err);
+    } finally {
+      isTranslating = false;
+      updateFloatingButton();
+    }
   }
 
   // ============================================================

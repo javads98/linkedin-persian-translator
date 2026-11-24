@@ -1,46 +1,49 @@
-// Background service worker for LinkedIn Persian Translator
+// Background service worker for LinkedIn Persian Translator v2
 
-// Translation cache to avoid re-translating the same text
+// Translation cache
 const translationCache = new Map();
 
-// Rate limiting
-let requestQueue = [];
-let isProcessingQueue = false;
-const RATE_LIMIT_DELAY = 100; // ms between requests
-
-// Listen for messages from content script
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'translate') {
-    handleTranslation(request.text, request.sourceLang)
+    translateSingle(request.text, request.sourceLang)
       .then(result => sendResponse({ success: true, translated: result }))
-      .catch(err => sendResponse({ success: false, error: err.message }));
-    return true; // Keep message channel open for async response
+      .catch(err => {
+        console.error('[LinkedIn-FA BG] translate error:', err);
+        sendResponse({ success: false, error: err.message });
+      });
+    return true;
   }
 
   if (request.action === 'translateBatch') {
-    handleBatchTranslation(request.texts, request.sourceLang)
+    translateBatch(request.texts, request.sourceLang)
       .then(results => sendResponse({ success: true, translations: results }))
-      .catch(err => sendResponse({ success: false, error: err.message }));
+      .catch(err => {
+        console.error('[LinkedIn-FA BG] batch error:', err);
+        sendResponse({ success: false, error: err.message });
+      });
     return true;
   }
 
   if (request.action === 'getSettings') {
-    chrome.storage.local.get(['translationEnabled', 'autoTranslate', 'translationEngine'], (data) => {
-      sendResponse({
-        translationEnabled: data.translationEnabled !== false,
-        autoTranslate: data.autoTranslate || false,
-        translationEngine: data.translationEngine || 'google'
-      });
-    });
+    chrome.storage.local.get(
+      ['translationEnabled', 'autoTranslate', 'translationEngine'],
+      (data) => {
+        sendResponse({
+          translationEnabled: data.translationEnabled !== false ? (data.translationEnabled || false) : false,
+          autoTranslate: data.autoTranslate || false,
+          translationEngine: data.translationEngine || 'google'
+        });
+      }
+    );
     return true;
   }
 });
 
-async function handleTranslation(text, sourceLang = 'auto') {
+// ---- Single translation ----
+async function translateSingle(text, sourceLang = 'auto') {
   if (!text || text.trim().length === 0) return text;
 
-  // Check cache first
-  const cacheKey = `${sourceLang}:${text}`;
+  const cacheKey = text.trim();
   if (translationCache.has(cacheKey)) {
     return translationCache.get(cacheKey);
   }
@@ -48,104 +51,146 @@ async function handleTranslation(text, sourceLang = 'auto') {
   const settings = await getSettings();
   let translated;
 
-  if (settings.translationEngine === 'mymemory') {
-    translated = await translateWithMyMemory(text, sourceLang);
-  } else {
-    translated = await translateWithGoogle(text, sourceLang);
+  try {
+    if (settings.translationEngine === 'mymemory') {
+      translated = await callMyMemory(text, sourceLang);
+    } else {
+      translated = await callGoogle(text, sourceLang);
+    }
+  } catch (err) {
+    console.error('[LinkedIn-FA BG] API error, trying fallback:', err.message);
+    // Fallback to the other engine
+    try {
+      if (settings.translationEngine === 'mymemory') {
+        translated = await callGoogle(text, sourceLang);
+      } else {
+        translated = await callMyMemory(text, sourceLang);
+      }
+    } catch (err2) {
+      console.error('[LinkedIn-FA BG] Fallback also failed:', err2.message);
+      return text; // Return original on total failure
+    }
   }
 
-  // Cache the result
+  // Cache
   translationCache.set(cacheKey, translated);
-
-  // Limit cache size
-  if (translationCache.size > 5000) {
-    const firstKey = translationCache.keys().next().value;
-    translationCache.delete(firstKey);
+  if (translationCache.size > 8000) {
+    const first = translationCache.keys().next().value;
+    translationCache.delete(first);
   }
 
   return translated;
 }
 
-async function handleBatchTranslation(texts, sourceLang = 'auto') {
-  const results = [];
-  const uncachedTexts = [];
-  const uncachedIndices = [];
+// ---- Batch translation ----
+async function translateBatch(texts, sourceLang = 'auto') {
+  if (!texts || texts.length === 0) return [];
 
-  // Check cache for each text
+  const results = new Array(texts.length);
+  const toTranslate = []; // { index, text }
+
+  // Check cache
   for (let i = 0; i < texts.length; i++) {
-    const cacheKey = `${sourceLang}:${texts[i]}`;
-    if (translationCache.has(cacheKey)) {
-      results[i] = translationCache.get(cacheKey);
+    const key = texts[i].trim();
+    if (translationCache.has(key)) {
+      results[i] = translationCache.get(key);
     } else {
-      uncachedTexts.push(texts[i]);
-      uncachedIndices.push(i);
+      toTranslate.push({ index: i, text: texts[i] });
     }
   }
 
-  // Translate uncached texts in batches
-  const BATCH_SIZE = 10;
-  for (let i = 0; i < uncachedTexts.length; i += BATCH_SIZE) {
-    const batch = uncachedTexts.slice(i, i + BATCH_SIZE);
-    const batchTranslations = await Promise.all(
-      batch.map(text => handleTranslation(text, sourceLang))
-    );
+  // Translate uncached — use Google's batch-friendly endpoint
+  // Google Translate can handle multiple q params
+  if (toTranslate.length > 0) {
+    const settings = await getSettings();
 
-    for (let j = 0; j < batchTranslations.length; j++) {
-      const originalIndex = uncachedIndices[i + j];
-      results[originalIndex] = batchTranslations[j];
-    }
-
-    // Small delay between batches
-    if (i + BATCH_SIZE < uncachedTexts.length) {
-      await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY));
+    if (settings.translationEngine === 'mymemory') {
+      // MyMemory doesn't support batch, translate one by one
+      await Promise.all(
+        toTranslate.map(async ({ index, text }) => {
+          try {
+            results[index] = await translateSingle(text, sourceLang);
+          } catch {
+            results[index] = text;
+          }
+        })
+      );
+    } else {
+      // Google Translate — send individual requests in parallel with concurrency limit
+      const CONCURRENCY = 5;
+      for (let i = 0; i < toTranslate.length; i += CONCURRENCY) {
+        const chunk = toTranslate.slice(i, i + CONCURRENCY);
+        await Promise.all(
+          chunk.map(async ({ index, text }) => {
+            try {
+              results[index] = await translateSingle(text, sourceLang);
+            } catch {
+              results[index] = text;
+            }
+          })
+        );
+      }
     }
   }
 
   return results;
 }
 
-async function translateWithGoogle(text, sourceLang) {
-  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=fa&dt=t&q=${encodeURIComponent(text)}`;
+// ---- Google Translate (free endpoint) ----
+async function callGoogle(text, sourceLang) {
+  const url =
+    'https://translate.googleapis.com/translate_a/single?client=gtx' +
+    '&sl=' + encodeURIComponent(sourceLang) +
+    '&tl=fa' +
+    '&dt=t' +
+    '&dj=1' +           // JSON response
+    '&q=' + encodeURIComponent(text);
 
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Google Translate error: ${response.status}`);
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    throw new Error('Google HTTP ' + resp.status);
   }
 
-  const data = await response.json();
-  let translated = '';
-  if (data && data[0]) {
-    for (const segment of data[0]) {
-      if (segment[0]) {
-        translated += segment[0];
-      }
+  const data = await resp.json();
+  let out = '';
+  if (data && data.sentences) {
+    for (const s of data.sentences) {
+      if (s.trans) out += s.trans;
+    }
+  } else if (data && Array.isArray(data[0])) {
+    // Fallback: array format
+    for (const seg of data[0]) {
+      if (seg[0]) out += seg[0];
     }
   }
-  return translated || text;
+  return out || text;
 }
 
-async function translateWithMyMemory(text, sourceLang) {
-  const langPair = sourceLang === 'auto' ? 'en|fa' : `${sourceLang}|fa`;
-  const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${langPair}`;
+// ---- MyMemory ----
+async function callMyMemory(text, sourceLang) {
+  const sl = sourceLang === 'auto' ? 'en' : sourceLang;
+  const url =
+    'https://api.mymemory.translated.net/get?q=' +
+    encodeURIComponent(text) +
+    '&langpair=' + sl + '|fa';
 
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`MyMemory error: ${response.status}`);
-  }
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('MyMemory HTTP ' + resp.status);
 
-  const data = await response.json();
+  const data = await resp.json();
   if (data && data.responseData && data.responseData.translatedText) {
-    return data.responseData.translatedText;
+    const t = data.responseData.translatedText;
+    if (t === 'NO QUERY SPECIFIED' || t === '' || t === text) return text;
+    return t;
   }
   return text;
 }
 
-async function getSettings() {
+// ---- Settings helper ----
+function getSettings() {
   return new Promise((resolve) => {
     chrome.storage.local.get(['translationEngine'], (data) => {
-      resolve({
-        translationEngine: data.translationEngine || 'google'
-      });
+      resolve({ translationEngine: data.translationEngine || 'google' });
     });
   });
 }
